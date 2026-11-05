@@ -64,6 +64,49 @@ def fecha_bloqueo_para_mes(fecha_recibo):
 
 
 # ---------------------------------------------------------
+# CARGA PORCENTAJES DE CUOTA
+# Archivo: porcentajes_cuota.txt (misma carpeta que este script)
+# Formato: un porcentaje por linea, p. ej. 3 / 3,5 / 3.5 / 3,5%
+#          (3 = 3 % del capital inicial de apertura)
+# ---------------------------------------------------------
+
+FICHERO_PORCENTAJES = "porcentajes_cuota.txt"
+
+
+def _parsear_porcentajes(lineas):
+    porcentajes = set()
+    for linea in lineas:
+        linea = linea.strip().replace("%", "").replace(",", ".").strip()
+        if not linea:
+            continue
+        try:
+            valor = Decimal(linea)
+        except Exception:
+            continue
+        if valor > 0:
+            porcentajes.add(valor)
+    return sorted(porcentajes)
+
+
+def _leer_porcentajes():
+    ruta = _DIR / FICHERO_PORCENTAJES
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            return _parsear_porcentajes(f.readlines())
+    except FileNotFoundError:
+        return []
+
+
+porcentajes_cuota = _leer_porcentajes()
+
+
+def cuota_desde_porcentaje(capital_inicial, porcentaje):
+    return (Decimal(str(capital_inicial)) * Decimal(str(porcentaje)) / Decimal("100")).quantize(
+        Decimal("0.01"), ROUND_HALF_UP
+    )
+
+
+# ---------------------------------------------------------
 # FUNCIONES AUXILIARES
 # ---------------------------------------------------------
 
@@ -138,7 +181,8 @@ def aplica_en_recibo(fecha_orden, fecha_recibo):
 # ---------------------------------------------------------
 
 def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
-              seguro_tasa, fecha_joker=None, cambio_dia=None):
+              seguro_tasa, fecha_joker=None, cambio_dia=None,
+              cambio_cuota=None):
     """
     fecha_joker: fecha de la orden del Joker o None.
       Recibo Joker: no se cobra nada al cliente (ni cuota ni seguro).
@@ -149,6 +193,10 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
       intereses se calculan desde el recibo anterior hasta la nueva fecha
       (un solo bloque, dias reales / 365 o 366). Los recibos siguientes
       pasan todos al nuevo dia.
+
+    cambio_cuota: (fecha_peticion, nueva_cuota) o None.
+      Misma regla de bloqueo. Desde el recibo afectado se cobra la nueva
+      cuota; los intereses no cambian, cambia el capital amortizado.
 
     Devuelve (DataFrame, avisos) donde avisos describe a que recibo
     aplico cada operacion y si se salto alguno por la fecha de bloqueo.
@@ -166,6 +214,7 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
 
     joker_pendiente = fecha_joker is not None
     cambio_pendiente = cambio_dia is not None
+    cuota_pendiente = cambio_cuota is not None
 
     while saldo > 0:
 
@@ -189,6 +238,19 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
                 )
 
         fb = fecha_bloqueo_para_mes(fecha_recibo)
+
+        # -------- CAMBIO DE MENSUALIDAD --------
+        hay_cambio_cuota = False
+        if cuota_pendiente:
+            fecha_peticion_c, nueva_cuota = cambio_cuota
+            if aplica_en_recibo(fecha_peticion_c, fecha_recibo):
+                cuota_anterior = cuota
+                cuota = Decimal(str(nueva_cuota)).quantize(Decimal("0.01"), ROUND_HALF_UP)
+                hay_cambio_cuota = True
+                cuota_pendiente = False
+                avisos["cambio_cuota"] = (fecha_recibo, cuota_anterior, cuota)
+            elif fecha_peticion_c < fecha_recibo:
+                avisos["cambio_cuota_saltado"] = (fecha_recibo, fb)
 
         # -------- JOKER --------
         es_joker = False
@@ -235,12 +297,14 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
             "Fecha bloqueo": fb.strftime("%d/%m/%Y"),
             "Joker": "Si" if es_joker else "",
             "Cambio dia": "Si" if hay_cambio else "",
+            "Cambio cuota": "Si" if hay_cambio_cuota else "",
             "Desde": fecha_anterior.strftime("%d/%m/%Y"),
             "Dias": dias,
             "Base interes": f"Real/{dias_ano_real(fecha_anterior)}",
             "Capital pendiente (EUR)": float(capital_inicio),
             "Intereses (EUR)": float(interes),
             "Intereses capitalizados (EUR)": float(capitalizado),
+            "Cuota contrato (EUR)": float(cuota),
             "Cuota (EUR)": float(cuota_final),
             "Amortizacion (EUR)": float(amort),
             "Saldo (EUR)": float(saldo),
@@ -281,6 +345,12 @@ with col1:
     )
 
 with col2:
+    capital_inicial = st.number_input(
+        "Capital inicial de apertura (EUR)",
+        min_value=0.0, max_value=1_000_000.0, value=6000.0,
+        step=0.01, format="%.2f",
+        help="Base para calcular las cuotas: capital inicial x porcentaje del fichero."
+    )
     cuota_input = st.number_input(
         "Cuota mensual (EUR)",
         min_value=0.0, max_value=100_000.0, value=180.0,
@@ -298,12 +368,13 @@ with col2:
 
 st.divider()
 st.caption(
-    "Joker y cambio de dia de pago aplican al recibo inmediato siguiente a la orden. "
-    "Si la orden es igual o posterior a la fecha de bloqueo de ese recibo, "
-    "aplican al recibo siguiente. Se pueden simular por separado o juntos."
+    "Joker, cambio de dia de pago y cambio de mensualidad aplican al recibo "
+    "inmediato siguiente a la orden. Si la orden es igual o posterior a la fecha "
+    "de bloqueo de ese recibo, aplican al recibo siguiente. "
+    "Se pueden simular por separado o juntos."
 )
 
-colj, colc = st.columns(2)
+colj, colc, colm = st.columns(3)
 
 with colj:
     st.subheader("Joker")
@@ -339,6 +410,80 @@ with colc:
             "anterior hasta la nueva fecha de recibo."
         )
 
+with colm:
+    st.subheader("Cambio de mensualidad")
+    aplicar_cuota = st.radio(
+        "Aplicar cambio de mensualidad", ["No", "Si"], horizontal=True,
+        key="aplicar_cuota"
+    )
+    cambio_cuota = None
+    if aplicar_cuota == "Si":
+        if not porcentajes_cuota:
+            st.warning(f"No se encontro {FICHERO_PORCENTAJES}. Sube el fichero manualmente.")
+            fichero_pct = st.file_uploader(
+                f"Subir {FICHERO_PORCENTAJES}", type=["txt"], key="fichero_pct"
+            )
+            if fichero_pct:
+                porcentajes_cuota = _parsear_porcentajes(
+                    fichero_pct.read().decode("utf-8").splitlines()
+                )
+                if porcentajes_cuota:
+                    st.success(f"{len(porcentajes_cuota)} porcentajes cargados.")
+
+        cuota_desplegable = None
+        if porcentajes_cuota:
+            opciones_cuota = {
+                f"{cuota_desde_porcentaje(capital_inicial, p):,.2f} EUR "
+                f"({str(p).replace('.', ',')} %)": p
+                for p in porcentajes_cuota
+            }
+            etiqueta = st.selectbox(
+                "Nueva mensualidad", list(opciones_cuota.keys()), key="nueva_cuota"
+            )
+            cuota_desplegable = cuota_desde_porcentaje(
+                capital_inicial, opciones_cuota[etiqueta]
+            )
+
+        # Mensualidad forzada: si se rellena, tiene prioridad sobre el desplegable
+        texto_forzada = st.text_input(
+            "Mensualidad forzada (EUR)", value="", key="cuota_forzada",
+            help="Opcional. Si se rellena, se usa este importe en lugar del desplegable."
+        )
+        cuota_forzada = None
+        if texto_forzada.strip():
+            try:
+                cuota_forzada = Decimal(
+                    texto_forzada.strip().replace(".", "").replace(",", ".")
+                    if "," in texto_forzada else texto_forzada.strip()
+                ).quantize(Decimal("0.01"), ROUND_HALF_UP)
+                if cuota_forzada <= 0:
+                    raise ValueError
+            except Exception:
+                cuota_forzada = None
+                st.error("Mensualidad forzada no valida. Usa un importe como 175,50.")
+
+        if cuota_forzada is not None:
+            nueva_cuota = cuota_forzada
+            origen = "mensualidad forzada"
+        elif cuota_desplegable is not None:
+            nueva_cuota = cuota_desplegable
+            origen = f"desplegable: capital inicial ({capital_inicial:,.2f} EUR) x porcentaje"
+        else:
+            nueva_cuota = None
+
+        if nueva_cuota is not None:
+            fecha_cambio_cuota = st.date_input(
+                "Fecha de la peticion del cambio", fecha_simulacion,
+                key="fecha_cambio_cuota"
+            )
+            cambio_cuota = (fecha_cambio_cuota, nueva_cuota)
+            st.caption(
+                f"Nueva mensualidad: {nueva_cuota:,.2f} EUR ({origen}). "
+                "Los intereses no cambian; cambia el capital amortizado."
+            )
+        else:
+            st.caption("Elige una mensualidad del desplegable o rellena la mensualidad forzada.")
+
 
 # ---------------------------------------------------------
 # RESULTADO
@@ -346,8 +491,26 @@ with colc:
 
 df, avisos = simulador(
     capital, tin, cuota_input, fecha_inicio, dia_recibo,
-    seguro_tasa, fecha_joker, cambio_dia
+    seguro_tasa, fecha_joker, cambio_dia, cambio_cuota
 )
+
+if cambio_cuota is not None:
+    if "cambio_cuota" in avisos:
+        recibo_c, cuota_ant, cuota_nueva = avisos["cambio_cuota"]
+        texto = (
+            f"Cambio de mensualidad pedido el {cambio_cuota[0]:%d/%m/%Y}: desde el recibo "
+            f"del {recibo_c:%d/%m/%Y} la cuota pasa de {cuota_ant:,.2f} EUR "
+            f"a {cuota_nueva:,.2f} EUR."
+        )
+        if "cambio_cuota_saltado" in avisos:
+            saltado, fb_s = avisos["cambio_cuota_saltado"]
+            texto += (
+                f" No afecta al recibo del {saltado:%d/%m/%Y} porque la peticion es "
+                f"igual o posterior a su fecha de bloqueo ({fb_s:%d/%m/%Y})."
+            )
+        st.info(texto)
+    else:
+        st.warning("El credito se cancela antes de que el cambio de mensualidad llegue a aplicarse.")
 
 if cambio_dia is not None:
     if "cambio_dia" in avisos:
