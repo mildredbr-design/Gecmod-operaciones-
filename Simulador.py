@@ -222,8 +222,7 @@ with col1:
     )
     tin = st.number_input("TIN anual (%)", 0.0, 100.0, 21.79)
     fecha_inicio = st.date_input(
-        "Fecha de ultimo recibo / Fecha de financiacion",
-        datetime.today(), format="DD/MM/YYYY"
+        "Fecha de ultimo recibo / Fecha de financiacion", datetime.today()
     )
     dia_recibo = st.selectbox("Dia del recibo", list(range(1, 29)))
 
@@ -252,11 +251,13 @@ st.caption(
     "y los intereses del periodo se suman al capital pendiente."
 )
 
-aplicar_joker = st.checkbox("Aplicar Joker")
+aplicar_joker = st.radio(
+    "Aplicar Joker", ["No", "Si"], horizontal=True, key="aplicar_joker"
+)
 fecha_joker = None
-if aplicar_joker:
+if aplicar_joker == "Si":
     fecha_joker = st.date_input(
-        "Fecha de la orden del Joker", fecha_inicio, format="DD/MM/YYYY"
+        "Fecha de la orden del Joker", fecha_inicio, key="fecha_joker"
     )
 
 
@@ -306,18 +307,8 @@ else:
             m2.metric("Intereses capitalizados", f"{fila['Intereses capitalizados (EUR)']:,.2f} EUR")
             m3.metric("Capital tras el Joker", f"{fila['Saldo (EUR)']:,.2f} EUR")
 
-    columnas_eur = [c for c in df.columns if "(EUR)" in c]
-
-    def _resaltar_joker(row):
-        color = "background-color: #f9eeda" if row["Joker"] == "Si" else ""
-        return [color] * len(row)
-
     st.subheader("Cuadro de amortizacion")
-    st.dataframe(
-        df.style.apply(_resaltar_joker, axis=1)
-               .format({c: "{:,.2f}" for c in columnas_eur}),
-        hide_index=True, use_container_width=True
-    )
+    st.dataframe(df.round(2))
 
     t1, t2, t3 = st.columns(3)
     t1.metric("Numero de recibos", len(df))
