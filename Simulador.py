@@ -7,8 +7,8 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 
 getcontext().prec = 10
 
-st.set_page_config(page_title="Simulador Joker", layout="wide")
-st.title("Simulador Joker — Revolving")
+st.set_page_config(page_title="Simulador Joker y cambio de dia", layout="wide")
+st.title("Simulador Joker y cambio de dia — Revolving")
 
 # ---------------------------------------------------------
 # CARGA FECHAS DE BLOQUEO
@@ -120,25 +120,17 @@ def interes_periodo(capital, tin, fecha_ini, fecha_fin):
 
 
 # ---------------------------------------------------------
-# JOKER: a que recibo aplica
-#   - Por defecto, al recibo inmediato siguiente a la orden.
-#   - Si la orden es igual o posterior a la fecha de bloqueo de ese
-#     recibo, aplica al recibo siguiente.
-# Devuelve (recibo_joker, recibo_inmediato, bloqueo_inmediato)
+# REGLA DE BLOQUEO (Joker y cambio de dia de pago)
+#   Una orden aplica al primer recibo posterior a la orden cuya
+#   fecha de bloqueo sea posterior a la orden:
+#   - Orden anterior al bloqueo del recibo inmediato -> ese recibo.
+#   - Orden igual o posterior a ese bloqueo -> el recibo siguiente.
 # ---------------------------------------------------------
 
-def determinar_recibo_joker(fecha_joker, fecha_inicio, dia_recibo):
-    recibo_inmediato = primer_recibo(fecha_inicio, dia_recibo)
-    while recibo_inmediato <= fecha_joker:
-        recibo_inmediato = recibo_siguiente(recibo_inmediato, dia_recibo)
-
-    fb_inmediato = fecha_bloqueo_para_mes(recibo_inmediato)
-    if fecha_joker < fb_inmediato:
-        recibo_joker = recibo_inmediato
-    else:
-        recibo_joker = recibo_siguiente(recibo_inmediato, dia_recibo)
-
-    return recibo_joker, recibo_inmediato, fb_inmediato
+def aplica_en_recibo(fecha_orden, fecha_recibo):
+    """True si la orden afecta a este recibo; False si llega tarde (bloqueo)."""
+    fb = fecha_bloqueo_para_mes(fecha_recibo)
+    return fecha_orden < fb and fecha_orden < fecha_recibo
 
 
 # ---------------------------------------------------------
@@ -146,30 +138,74 @@ def determinar_recibo_joker(fecha_joker, fecha_inicio, dia_recibo):
 # ---------------------------------------------------------
 
 def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
-              seguro_tasa, fecha_joker_recibo=None):
+              seguro_tasa, fecha_joker=None, cambio_dia=None):
     """
-    Recibo Joker: no se cobra nada al cliente (ni cuota ni seguro).
-    Los intereses del periodo se calculan y se suman al capital pendiente,
-    de modo que el recibo siguiente calcula intereses sobre capital + intereses.
+    fecha_joker: fecha de la orden del Joker o None.
+      Recibo Joker: no se cobra nada al cliente (ni cuota ni seguro).
+      Los intereses del periodo se suman al capital pendiente.
+
+    cambio_dia: (fecha_peticion, nuevo_dia) o None.
+      El recibo afectado se mueve al nuevo dia dentro de su mismo mes y los
+      intereses se calculan desde el recibo anterior hasta la nueva fecha
+      (un solo bloque, dias reales / 365 o 366). Los recibos siguientes
+      pasan todos al nuevo dia.
+
+    Devuelve (DataFrame, avisos) donde avisos describe a que recibo
+    aplico cada operacion y si se salto alguno por la fecha de bloqueo.
     """
     saldo = Decimal(str(capital))
     seguro_tasa = Decimal(str(seguro_tasa))
     cuota = Decimal(str(cuota_mensual)).quantize(Decimal("0.01"), ROUND_HALF_UP)
 
-    fecha_recibo = primer_recibo(fecha_inicio, dia_recibo)
+    dia_actual = dia_recibo
+    fecha_recibo = primer_recibo(fecha_inicio, dia_actual)
     fecha_anterior = fecha_inicio
     datos = []
+    avisos = {}
     mes = 1
 
+    joker_pendiente = fecha_joker is not None
+    cambio_pendiente = cambio_dia is not None
+
     while saldo > 0:
+
+        # -------- CAMBIO DE DIA DE PAGO --------
+        hay_cambio = False
+        if cambio_pendiente:
+            fecha_peticion, nuevo_dia = cambio_dia
+            if aplica_en_recibo(fecha_peticion, fecha_recibo):
+                recibo_original = fecha_recibo
+                fecha_recibo = crear_fecha_recibo(fecha_recibo, nuevo_dia)
+                # Si la nueva fecha ya ha pasado, se va al mes siguiente
+                if fecha_recibo <= max(fecha_anterior, fecha_peticion):
+                    fecha_recibo = recibo_siguiente(fecha_recibo, nuevo_dia)
+                dia_actual = nuevo_dia
+                hay_cambio = True
+                cambio_pendiente = False
+                avisos["cambio_dia"] = (recibo_original, fecha_recibo)
+            elif fecha_peticion < fecha_recibo:
+                avisos["cambio_dia_saltado"] = (
+                    fecha_recibo, fecha_bloqueo_para_mes(fecha_recibo)
+                )
+
         fb = fecha_bloqueo_para_mes(fecha_recibo)
+
+        # -------- JOKER --------
+        es_joker = False
+        if joker_pendiente:
+            if aplica_en_recibo(fecha_joker, fecha_recibo):
+                es_joker = True
+                joker_pendiente = False
+                avisos["joker"] = fecha_recibo
+            elif fecha_joker < fecha_recibo:
+                avisos["joker_saltado"] = (fecha_recibo, fb)
+
+        # -------- INTERESES: recibo anterior -> recibo actual --------
         dias = (fecha_recibo - fecha_anterior).days
         capital_inicio = saldo
 
         interes = interes_periodo(saldo, tin, fecha_anterior, fecha_recibo)
         interes = interes.quantize(Decimal("0.01"), ROUND_HALF_UP)
-
-        es_joker = fecha_joker_recibo is not None and fecha_recibo == fecha_joker_recibo
 
         if es_joker:
             capitalizado = interes
@@ -198,6 +234,8 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
             "Fecha recibo": fecha_recibo.strftime("%d/%m/%Y"),
             "Fecha bloqueo": fb.strftime("%d/%m/%Y"),
             "Joker": "Si" if es_joker else "",
+            "Cambio dia": "Si" if hay_cambio else "",
+            "Desde": fecha_anterior.strftime("%d/%m/%Y"),
             "Dias": dias,
             "Base interes": f"Real/{dias_ano_real(fecha_anterior)}",
             "Capital pendiente (EUR)": float(capital_inicio),
@@ -211,13 +249,13 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
         })
 
         fecha_anterior = fecha_recibo
-        fecha_recibo = recibo_siguiente(fecha_recibo, dia_recibo)
+        fecha_recibo = recibo_siguiente(fecha_recibo, dia_actual)
         mes += 1
 
         if mes > 600:
             break
 
-    return pd.DataFrame(datos)
+    return pd.DataFrame(datos), avisos
 
 
 # ---------------------------------------------------------
@@ -259,69 +297,101 @@ with col2:
     seguro_tasa = opciones_seguro[seguro_str]
 
 st.divider()
-st.subheader("Joker")
 st.caption(
-    "El Joker aplica al recibo inmediato siguiente a la orden. "
+    "Joker y cambio de dia de pago aplican al recibo inmediato siguiente a la orden. "
     "Si la orden es igual o posterior a la fecha de bloqueo de ese recibo, "
-    "aplica al recibo siguiente. En el recibo Joker el cliente no paga nada "
-    "y los intereses del periodo se suman al capital pendiente."
+    "aplican al recibo siguiente. Se pueden simular por separado o juntos."
 )
 
-aplicar_joker = st.radio(
-    "Aplicar Joker", ["No", "Si"], horizontal=True, key="aplicar_joker"
-)
-fecha_joker = None
-if aplicar_joker == "Si":
-    fecha_joker = st.date_input(
-        "Fecha de la orden del Joker", fecha_simulacion, key="fecha_joker"
+colj, colc = st.columns(2)
+
+with colj:
+    st.subheader("Joker")
+    aplicar_joker = st.radio(
+        "Aplicar Joker", ["No", "Si"], horizontal=True, key="aplicar_joker"
     )
+    fecha_joker = None
+    if aplicar_joker == "Si":
+        fecha_joker = st.date_input(
+            "Fecha de la orden del Joker", fecha_simulacion, key="fecha_joker"
+        )
+        st.caption(
+            "En el recibo Joker el cliente no paga nada y los intereses "
+            "del periodo se suman al capital pendiente."
+        )
+
+with colc:
+    st.subheader("Cambio de dia de pago")
+    aplicar_cambio = st.radio(
+        "Aplicar cambio de dia", ["No", "Si"], horizontal=True, key="aplicar_cambio"
+    )
+    cambio_dia = None
+    if aplicar_cambio == "Si":
+        nuevo_dia = st.selectbox(
+            "Nuevo dia de recibo", list(range(1, 29)), key="nuevo_dia"
+        )
+        fecha_cambio = st.date_input(
+            "Fecha de la peticion del cambio", fecha_simulacion, key="fecha_cambio"
+        )
+        cambio_dia = (fecha_cambio, nuevo_dia)
+        st.caption(
+            "Los intereses del recibo afectado se calculan desde el recibo "
+            "anterior hasta la nueva fecha de recibo."
+        )
 
 
 # ---------------------------------------------------------
 # RESULTADO
 # ---------------------------------------------------------
 
-recibo_joker = None
-if fecha_joker is not None:
-    recibo_joker, recibo_inmediato, fb_inmediato = determinar_recibo_joker(
-        fecha_joker, fecha_inicio, dia_recibo
-    )
-    if recibo_joker == recibo_inmediato:
-        motivo = (
-            f"la orden es anterior a la fecha de bloqueo "
-            f"({fb_inmediato:%d/%m/%Y}) del recibo inmediato"
-        )
-    else:
-        motivo = (
-            f"la orden es igual o posterior a la fecha de bloqueo "
-            f"({fb_inmediato:%d/%m/%Y}) del recibo del {recibo_inmediato:%d/%m/%Y}"
-        )
-    st.info(
-        f"Orden Joker: {fecha_joker:%d/%m/%Y}. "
-        f"El Joker se aplica en el recibo del {recibo_joker:%d/%m/%Y} porque {motivo}."
-    )
-
-df = simulador(
+df, avisos = simulador(
     capital, tin, cuota_input, fecha_inicio, dia_recibo,
-    seguro_tasa, recibo_joker
+    seguro_tasa, fecha_joker, cambio_dia
 )
+
+if cambio_dia is not None:
+    if "cambio_dia" in avisos:
+        original, nuevo = avisos["cambio_dia"]
+        texto = (
+            f"Cambio de dia pedido el {cambio_dia[0]:%d/%m/%Y}: el recibo del "
+            f"{original:%d/%m/%Y} pasa al {nuevo:%d/%m/%Y}."
+        )
+        if "cambio_dia_saltado" in avisos:
+            saltado, fb_s = avisos["cambio_dia_saltado"]
+            texto += (
+                f" No afecta al recibo del {saltado:%d/%m/%Y} porque la peticion es "
+                f"igual o posterior a su fecha de bloqueo ({fb_s:%d/%m/%Y})."
+            )
+        st.info(texto)
+    else:
+        st.warning("El credito se cancela antes de que el cambio de dia llegue a aplicarse.")
+
+if fecha_joker is not None:
+    if "joker" in avisos:
+        texto = (
+            f"Orden Joker: {fecha_joker:%d/%m/%Y}. El Joker se aplica en el recibo "
+            f"del {avisos['joker']:%d/%m/%Y}."
+        )
+        if "joker_saltado" in avisos:
+            saltado, fb_s = avisos["joker_saltado"]
+            texto += (
+                f" No afecta al recibo del {saltado:%d/%m/%Y} porque la orden es "
+                f"igual o posterior a su fecha de bloqueo ({fb_s:%d/%m/%Y})."
+            )
+        st.info(texto)
+    else:
+        st.warning("El credito se cancela antes de que el Joker llegue a aplicarse.")
 
 if df.empty:
     st.warning("No hay recibos que mostrar: el capital pendiente es 0.")
 else:
-    if recibo_joker is not None:
-        fila = df[df["Joker"] == "Si"]
-        if fila.empty:
-            st.warning(
-                f"El credito se cancela antes del recibo del {recibo_joker:%d/%m/%Y}; "
-                "el Joker no llega a aplicarse."
-            )
-        else:
-            fila = fila.iloc[0]
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Capital antes del Joker", f"{fila['Capital pendiente (EUR)']:,.2f} EUR")
-            m2.metric("Intereses capitalizados", f"{fila['Intereses capitalizados (EUR)']:,.2f} EUR")
-            m3.metric("Capital tras el Joker", f"{fila['Saldo (EUR)']:,.2f} EUR")
+    fila = df[df["Joker"] == "Si"]
+    if not fila.empty:
+        fila = fila.iloc[0]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Capital antes del Joker", f"{fila['Capital pendiente (EUR)']:,.2f} EUR")
+        m2.metric("Intereses capitalizados", f"{fila['Intereses capitalizados (EUR)']:,.2f} EUR")
+        m3.metric("Capital tras el Joker", f"{fila['Saldo (EUR)']:,.2f} EUR")
 
     st.subheader("Cuadro de amortizacion")
     st.dataframe(df.round(2))
