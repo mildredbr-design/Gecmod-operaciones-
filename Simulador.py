@@ -95,6 +95,18 @@ def recibo_siguiente(fecha_recibo, dia_recibo):
     return crear_fecha_recibo(siguiente_mes_fecha(fecha_recibo, dia_recibo), dia_recibo)
 
 
+def ultimo_recibo_hasta(fecha, dia_recibo):
+    """Ultimo recibo pasado en o antes de 'fecha' (inicio del periodo de intereses)."""
+    fecha_recibo = crear_fecha_recibo(fecha, dia_recibo)
+    if fecha_recibo > fecha:
+        if fecha.month == 1:
+            mes_anterior = date(fecha.year - 1, 12, 1)
+        else:
+            mes_anterior = date(fecha.year, fecha.month - 1, 1)
+        fecha_recibo = crear_fecha_recibo(mes_anterior, dia_recibo)
+    return fecha_recibo
+
+
 # ---------------------------------------------------------
 # INTERESES REVOLVING: dias reales / ano real (365 o 366)
 # ---------------------------------------------------------
@@ -221,10 +233,14 @@ with col1:
         step=0.01, format="%.2f"
     )
     tin = st.number_input("TIN anual (%)", 0.0, 100.0, 21.79)
-    fecha_inicio = st.date_input(
-        "Fecha de ultimo recibo / Fecha de financiacion", datetime.today()
-    )
+    fecha_simulacion = st.date_input("Fecha de simulacion", datetime.today())
     dia_recibo = st.selectbox("Dia del recibo", list(range(1, 29)))
+    # Los intereses se calculan siempre desde el ultimo recibo pasado
+    fecha_inicio = ultimo_recibo_hasta(fecha_simulacion, dia_recibo)
+    st.caption(
+        f"Recibo anterior: {fecha_inicio:%d/%m/%Y}. "
+        "El capital pendiente es el que queda tras ese recibo."
+    )
 
 with col2:
     cuota_input = st.number_input(
@@ -257,7 +273,7 @@ aplicar_joker = st.radio(
 fecha_joker = None
 if aplicar_joker == "Si":
     fecha_joker = st.date_input(
-        "Fecha de la orden del Joker", fecha_inicio, key="fecha_joker"
+        "Fecha de la orden del Joker", fecha_simulacion, key="fecha_joker"
     )
 
 
