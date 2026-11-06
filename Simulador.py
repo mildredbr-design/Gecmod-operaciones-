@@ -65,12 +65,17 @@ def fecha_bloqueo_para_mes(fecha_recibo):
 
 # ---------------------------------------------------------
 # CARGA PORCENTAJES DE CUOTA
-# Archivo: porcentajes_cuota.txt (misma carpeta que este script)
-# Formato: un porcentaje por linea, p. ej. 3 / 3,5 / 3.5 / 3,5%
-#          (3 = 3 % del capital inicial de apertura)
+# Carpeta: porcentajes/ (junto a este script), un TXT por producto.
+#   - El nombre del fichero es el producto: porcentajes_vitesse.txt -> "Vitesse"
+#   - Cada bloque empieza con su titulo entre corchetes: [TAE 23,85% desde ...]
+#     y debajo sus porcentajes, uno por linea (3 = 3 %).
+#   - Un fichero sin titulos es un unico bloque.
+# Si la carpeta no existe, se leen los porcentaje(s)_*.txt junto a este script.
 # ---------------------------------------------------------
 
+CARPETA_PORCENTAJES = "porcentajes"
 FICHERO_PORCENTAJES = "porcentajes_cuota.txt"
+BLOQUE_UNICO = "Bloque unico"
 
 
 def _parsear_porcentajes(lineas):
@@ -88,16 +93,53 @@ def _parsear_porcentajes(lineas):
     return sorted(porcentajes)
 
 
-def _leer_porcentajes():
-    ruta = _DIR / FICHERO_PORCENTAJES
-    try:
-        with open(ruta, "r", encoding="utf-8") as f:
-            return _parsear_porcentajes(f.readlines())
-    except FileNotFoundError:
-        return []
+def _parsear_bloques(lineas):
+    """Devuelve {nombre_bloque: [porcentajes]} respetando el orden del fichero."""
+    bloques = {}
+    actual = BLOQUE_UNICO
+    for linea in lineas:
+        linea = linea.strip()
+        if not linea:
+            continue
+        if linea.startswith("[") and linea.endswith("]"):
+            actual = linea[1:-1].strip() or BLOQUE_UNICO
+            bloques.setdefault(actual, [])
+            continue
+        bloques.setdefault(actual, []).extend(_parsear_porcentajes([linea]))
+    return {b: sorted(set(v)) for b, v in bloques.items() if v}
 
 
-porcentajes_cuota = _leer_porcentajes()
+def _nombre_producto(nombre_fichero):
+    nombre = pathlib.Path(nombre_fichero).stem
+    for prefijo in ("porcentajes_", "porcentaje_"):
+        if nombre.lower().startswith(prefijo):
+            nombre = nombre[len(prefijo):]
+            break
+    return nombre.replace("_", " ").strip().capitalize() or "Producto"
+
+
+def _leer_productos():
+    """Devuelve {producto: {bloque: [porcentajes]}}."""
+    productos = {}
+    carpeta = _DIR / CARPETA_PORCENTAJES
+    if carpeta.is_dir():
+        for ruta in sorted(carpeta.glob("*.txt")):
+            with open(ruta, "r", encoding="utf-8") as f:
+                bloques = _parsear_bloques(f.readlines())
+            if bloques:
+                productos[_nombre_producto(ruta.name)] = bloques
+    if not productos:
+        # Sin carpeta: TXT porcentaje(s)_*.txt junto al script
+        for ruta in sorted(_DIR.glob("porcentaje*.txt")):
+            with open(ruta, "r", encoding="utf-8") as f:
+                bloques = _parsear_bloques(f.readlines())
+            if bloques:
+                productos[_nombre_producto(ruta.name)] = bloques
+    return productos
+
+
+productos_porcentajes = _leer_productos()
+porcentajes_cuota = []  # se rellena con el bloque elegido en pantalla
 
 
 CUOTA_MINIMA = Decimal("15.00")  # cuota por porcentaje inferior a este importe -> se fija en 15
@@ -480,21 +522,49 @@ def tae_del_cuadro(df, capital, fecha_inicio, disposicion_aplicada=None):
 # INPUTS
 # ---------------------------------------------------------
 
-if not porcentajes_cuota:
-    st.warning(f"No se encontro {FICHERO_PORCENTAJES}. Sube el fichero manualmente.")
-    fichero_pct = st.file_uploader(
-        f"Subir {FICHERO_PORCENTAJES}", type=["txt"], key="fichero_pct"
+if not productos_porcentajes:
+    st.warning(
+        f"No se encontro la carpeta {CARPETA_PORCENTAJES} con los TXT de porcentajes. "
+        "Sube los ficheros manualmente."
     )
-    if fichero_pct:
-        porcentajes_cuota = _parsear_porcentajes(
-            fichero_pct.read().decode("utf-8").splitlines()
-        )
-        if porcentajes_cuota:
-            st.success(f"{len(porcentajes_cuota)} porcentajes cargados.")
+    ficheros_pct = st.file_uploader(
+        "Subir TXT de porcentajes (uno por producto)", type=["txt"],
+        accept_multiple_files=True, key="fichero_pct"
+    )
+    for fichero_pct in ficheros_pct or []:
+        bloques = _parsear_bloques(fichero_pct.read().decode("utf-8").splitlines())
+        if bloques:
+            productos_porcentajes[_nombre_producto(fichero_pct.name)] = bloques
+    if productos_porcentajes:
+        st.success(f"{len(productos_porcentajes)} producto(s) cargado(s).")
 
 
 def etiqueta_pct(p):
     return f"{str(p).replace('.', ',')} %"
+
+
+# -------- PRODUCTO Y BLOQUE DE PORCENTAJES --------
+if productos_porcentajes:
+    cp1, cp2 = st.columns(2)
+    with cp1:
+        producto = st.selectbox(
+            "Producto", list(productos_porcentajes.keys()), key="producto"
+        )
+    bloques_producto = productos_porcentajes[producto]
+    with cp2:
+        if len(bloques_producto) > 1:
+            bloque = st.selectbox(
+                "Bloque de porcentajes", list(bloques_producto.keys()), key="bloque"
+            )
+        else:
+            bloque = next(iter(bloques_producto))
+            st.caption(f"{producto}: un unico bloque de porcentajes.")
+    porcentajes_cuota = bloques_producto[bloque]
+    st.caption(
+        f"Porcentajes del bloque ({len(porcentajes_cuota)}): "
+        + " · ".join(etiqueta_pct(p) for p in porcentajes_cuota)
+    )
+    st.divider()
 
 
 col1, col2 = st.columns(2)
