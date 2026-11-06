@@ -100,10 +100,25 @@ def _leer_porcentajes():
 porcentajes_cuota = _leer_porcentajes()
 
 
-def cuota_desde_porcentaje(capital_inicial, porcentaje):
-    return (Decimal(str(capital_inicial)) * Decimal(str(porcentaje)) / Decimal("100")).quantize(
+CUOTA_MINIMA = Decimal("15.00")  # cuota por porcentaje inferior a este importe -> se fija en 15
+
+
+def cuota_porcentaje_sin_minimo(base, porcentaje):
+    return (Decimal(str(base)) * Decimal(str(porcentaje)) / Decimal("100")).quantize(
         Decimal("0.01"), ROUND_HALF_UP
     )
+
+
+def cuota_desde_porcentaje(base, porcentaje):
+    return max(cuota_porcentaje_sin_minimo(base, porcentaje), CUOTA_MINIMA)
+
+
+def texto_minimo(base, porcentaje):
+    """Nota para pantalla cuando se aplica la cuota minima."""
+    bruta = cuota_porcentaje_sin_minimo(base, porcentaje)
+    if bruta < CUOTA_MINIMA:
+        return f" (resultado {bruta:,.2f} EUR, inferior al minimo: se fija en {CUOTA_MINIMA:,.2f} EUR)"
+    return ""
 
 
 # ---------------------------------------------------------
@@ -539,7 +554,8 @@ with col2:
         st.caption(
             f"Cuota: {cuota_input:,.2f} EUR = "
             f"{'capital inicial' if base_cuota == 'inicial' else 'capital pendiente'} "
-            f"({base_actual:,.2f} EUR) x {etiqueta_pct(pct_inicial)}."
+            f"({base_actual:,.2f} EUR) x {etiqueta_pct(pct_inicial)}"
+            f"{texto_minimo(base_actual, pct_inicial)}."
         )
     else:
         if modo_cuota == "Por porcentaje":
@@ -716,7 +732,8 @@ if "recalculo_cuota" in avisos:
     if rc["recibo"] is not None:
         st.info(
             f"Recalculo de cuota por disposicion: (capital pendiente + disposicion) "
-            f"{rc['base']:,.2f} EUR x {etiqueta_pct(rc['pct'])} = {rc['nueva']:,.2f} EUR. "
+            f"{rc['base']:,.2f} EUR x {etiqueta_pct(rc['pct'])} = {rc['nueva']:,.2f} EUR"
+            f"{texto_minimo(rc['base'], rc['pct'])}. "
             f"Desde el recibo del {rc['recibo']:%d/%m/%Y} la cuota pasa de "
             f"{rc['cuota_ant']:,.2f} EUR a {rc['nueva']:,.2f} EUR."
         )
@@ -759,7 +776,10 @@ if cambio_cuota is not None:
         recibo_c, cuota_ant, cuota_nueva, base_c = avisos["cambio_cuota"]
         calculo = ""
         if base_c is not None:
-            calculo = f" ({base_c:,.2f} EUR x {etiqueta_pct(cambio_cuota[2])})"
+            calculo = (
+                f" ({base_c:,.2f} EUR x {etiqueta_pct(cambio_cuota[2])}"
+                f"{texto_minimo(base_c, cambio_cuota[2])})"
+            )
         texto = (
             f"Cambio de mensualidad pedido el {cambio_cuota[0]:%d/%m/%Y}: desde el recibo "
             f"del {recibo_c:%d/%m/%Y} la cuota pasa de {cuota_ant:,.2f} EUR "
@@ -818,6 +838,51 @@ else:
         m1.metric("Capital antes del Joker", f"{fila['Capital pendiente (EUR)']:,.2f} EUR")
         m2.metric("Intereses capitalizados", f"{fila['Intereses capitalizados (EUR)']:,.2f} EUR")
         m3.metric("Capital tras el Joker", f"{fila['Saldo (EUR)']:,.2f} EUR")
+
+    # -------- COMPARATIVA DE MENSUALIDADES (solo con cambio de mensualidad) --------
+    if cambio_cuota is not None:
+        escenarios = [("Cuota actual (sin cambio)", None)]
+        escenarios += [(etiqueta_pct(p), ("pct", p)) for p in porcentajes_cuota]
+        if cuota_forzada is not None:
+            escenarios.append(("Mensualidad forzada", ("importe", cuota_forzada)))
+
+        filas = []
+        for nombre, cambio in escenarios:
+            cc = (cambio_cuota[0],) + cambio if cambio is not None else None
+            df_e, av_e = simulador(
+                capital, tin, cuota_input, fecha_inicio, dia_recibo, seguro_tasa,
+                fecha_joker, cambio_dia, cc, disposicion,
+                pct_inicial, base_cuota, capital_inicial
+            )
+            if df_e.empty:
+                continue
+            if "cambio_cuota" in av_e:
+                recibo_e, _, cuota_e, _ = av_e["cambio_cuota"]
+            else:
+                recibo_e = datetime.strptime(df_e["Fecha recibo"].iloc[0], "%d/%m/%Y").date()
+                cuota_e = Decimal(str(df_e["Cuota contrato (EUR)"].iloc[0]))
+            amortizado = df_e["Saldo (EUR)"].iloc[-1] <= 0
+            dispo_e = disposicion if "disposicion" in av_e else None
+            cer_e = tae_del_cuadro(df_e, capital, fecha_inicio, dispo_e)
+            filas.append({
+                "Seleccionada": "<<" if cc == cambio_cuota else "",
+                "Opcion": nombre,
+                "Proximo recibo (nueva cuota)": recibo_e.strftime("%d/%m/%Y"),
+                "Cuota (EUR)": float(cuota_e),
+                "Duracion (meses)": str(len(df_e)) if amortizado else "No se amortiza",
+                "Ultimo recibo": df_e["Fecha recibo"].iloc[-1] if amortizado else "",
+                "Total intereses (EUR)": round(float(df_e["Intereses (EUR)"].sum()), 2),
+                "Total a pagar capital + intereses (EUR)": round(float(df_e["Cuota (EUR)"].sum()), 2),
+                "CER (%)": f"{cer_e:.2f}" if cer_e is not None else "n/d",
+            })
+
+        st.subheader("Comparativa de mensualidades")
+        st.caption(
+            "Cada fila simula el credito con esa mensualidad desde el recibo en que se "
+            "aplica el cambio, manteniendo el resto de operaciones marcadas. "
+            "<< = opcion seleccionada."
+        )
+        st.dataframe(pd.DataFrame(filas))
 
     st.subheader("Cuadro de amortizacion")
     st.dataframe(df.round(2))
