@@ -182,7 +182,7 @@ def aplica_en_recibo(fecha_orden, fecha_recibo):
 
 def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
               seguro_tasa, fecha_joker=None, cambio_dia=None,
-              cambio_cuota=None):
+              cambio_cuota=None, disposicion=None):
     """
     fecha_joker: fecha de la orden del Joker o None.
       Recibo Joker: no se cobra nada al cliente (ni cuota ni seguro).
@@ -197,6 +197,16 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
     cambio_cuota: (fecha_peticion, nueva_cuota) o None.
       Misma regla de bloqueo. Desde el recibo afectado se cobra la nueva
       cuota; los intereses no cambian, cambia el capital amortizado.
+
+    disposicion: (fecha_disposicion, importe) o None.
+      - Antes de la fecha de bloqueo del recibo: el periodo se divide en dos.
+          Tramo 1: capital pendiente x dias (recibo anterior -> disposicion)
+          Tramo 2: (capital + disposicion) x dias (disposicion -> recibo)
+      - Igual o posterior al bloqueo: el recibo ya esta emitido y sus
+        intereses no cambian (capital pendiente x periodo completo). Los
+        intereses del importe dispuesto desde la disposicion hasta el recibo
+        se suman a los intereses del recibo siguiente.
+      En ambos casos el capital pendiente sube con la disposicion en ese recibo.
 
     Devuelve (DataFrame, avisos) donde avisos describe a que recibo
     aplico cada operacion y si se salto alguno por la fecha de bloqueo.
@@ -215,6 +225,8 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
     joker_pendiente = fecha_joker is not None
     cambio_pendiente = cambio_dia is not None
     cuota_pendiente = cambio_cuota is not None
+    dispo_pendiente = disposicion is not None
+    reg_intereses = Decimal("0")  # intereses de disposicion tras bloqueo, para el recibo siguiente
 
     while saldo > 0:
 
@@ -266,8 +278,41 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
         dias = (fecha_recibo - fecha_anterior).days
         capital_inicio = saldo
 
-        interes = interes_periodo(saldo, tin, fecha_anterior, fecha_recibo)
+        importe_dispo = Decimal("0")
+        reg_siguiente = Decimal("0")
+        if dispo_pendiente and fecha_anterior <= disposicion[0] < fecha_recibo:
+            fecha_dispo = disposicion[0]
+            importe_dispo = Decimal(str(disposicion[1])).quantize(Decimal("0.01"), ROUND_HALF_UP)
+            dispo_pendiente = False
+            if fecha_dispo < fb:
+                # Dos periodos dentro del mismo recibo
+                interes_t1 = interes_periodo(saldo, tin, fecha_anterior, fecha_dispo)
+                interes_t2 = interes_periodo(saldo + importe_dispo, tin, fecha_dispo, fecha_recibo)
+                interes = interes_t1 + interes_t2
+                avisos["disposicion"] = {
+                    "tipo": "antes", "recibo": fecha_recibo, "bloqueo": fb,
+                    "t1": (fecha_anterior, fecha_dispo, saldo, interes_t1),
+                    "t2": (fecha_dispo, fecha_recibo, saldo + importe_dispo, interes_t2),
+                }
+            else:
+                # Recibo emitido: no se tocan sus intereses; regularizacion al mes siguiente
+                interes = interes_periodo(saldo, tin, fecha_anterior, fecha_recibo)
+                reg_siguiente = interes_periodo(importe_dispo, tin, fecha_dispo, fecha_recibo)
+                avisos["disposicion"] = {
+                    "tipo": "despues", "recibo": fecha_recibo, "bloqueo": fb,
+                    "reg": (fecha_dispo, fecha_recibo, importe_dispo,
+                            reg_siguiente.quantize(Decimal("0.01"), ROUND_HALF_UP)),
+                }
+        else:
+            interes = interes_periodo(saldo, tin, fecha_anterior, fecha_recibo)
+
+        # Regularizacion de una disposicion tras bloqueo del recibo anterior
+        reg_aplicada = reg_intereses.quantize(Decimal("0.01"), ROUND_HALF_UP)
+        interes += reg_intereses
+        reg_intereses = reg_siguiente
+
         interes = interes.quantize(Decimal("0.01"), ROUND_HALF_UP)
+        saldo += importe_dispo
 
         if es_joker:
             capitalizado = interes
@@ -302,7 +347,9 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
             "Dias": dias,
             "Base interes": f"Real/{dias_ano_real(fecha_anterior)}",
             "Capital pendiente (EUR)": float(capital_inicio),
+            "Disposicion (EUR)": float(importe_dispo),
             "Intereses (EUR)": float(interes),
+            "Regul. disposicion (EUR)": float(reg_aplicada),
             "Intereses capitalizados (EUR)": float(capitalizado),
             "Cuota contrato (EUR)": float(cuota),
             "Cuota (EUR)": float(cuota_final),
@@ -373,6 +420,34 @@ st.caption(
     "de bloqueo de ese recibo, aplican al recibo siguiente. "
     "Se pueden simular por separado o juntos."
 )
+
+st.subheader("Disposicion")
+aplicar_dispo = st.radio(
+    "Hacer disposicion", ["No", "Si"], horizontal=True, key="aplicar_dispo"
+)
+disposicion = None
+if aplicar_dispo == "Si":
+    cd1, cd2 = st.columns(2)
+    with cd1:
+        importe_dispo_input = st.number_input(
+            "Importe de la disposicion (EUR)",
+            min_value=0.0, max_value=1_000_000.0, value=500.0,
+            step=0.01, format="%.2f", key="importe_dispo"
+        )
+    with cd2:
+        fecha_dispo_input = st.date_input(
+            "Fecha de la disposicion", fecha_simulacion, key="fecha_dispo"
+        )
+    if importe_dispo_input > 0:
+        disposicion = (fecha_dispo_input, importe_dispo_input)
+    st.caption(
+        "Antes del bloqueo: intereses en dos periodos (capital pendiente hasta la "
+        "disposicion; capital + disposicion desde la disposicion hasta el recibo). "
+        "Igual o posterior al bloqueo: el recibo no cambia y los intereses del importe "
+        "dispuesto hasta el recibo se suman al recibo siguiente."
+    )
+
+st.divider()
 
 colj, colc, colm = st.columns(3)
 
@@ -491,8 +566,38 @@ with colm:
 
 df, avisos = simulador(
     capital, tin, cuota_input, fecha_inicio, dia_recibo,
-    seguro_tasa, fecha_joker, cambio_dia, cambio_cuota
+    seguro_tasa, fecha_joker, cambio_dia, cambio_cuota, disposicion
 )
+
+if disposicion is not None:
+    info = avisos.get("disposicion")
+    if info is None:
+        st.warning(
+            "La fecha de la disposicion es anterior al recibo anterior o el credito "
+            "se cancela antes; la disposicion no se aplica."
+        )
+    elif info["tipo"] == "antes":
+        d1, h1, c1, i1 = info["t1"]
+        d2, h2, c2, i2 = info["t2"]
+        st.info(
+            f"Disposicion de {disposicion[1]:,.2f} EUR el {disposicion[0]:%d/%m/%Y}, "
+            f"anterior al bloqueo ({info['bloqueo']:%d/%m/%Y}): los intereses del recibo del "
+            f"{info['recibo']:%d/%m/%Y} se calculan en dos periodos.  \n"
+            f"Periodo 1: {d1:%d/%m/%Y} a {h1:%d/%m/%Y} ({(h1 - d1).days} dias) sobre "
+            f"{c1:,.2f} EUR = {i1:,.2f} EUR.  \n"
+            f"Periodo 2: {d2:%d/%m/%Y} a {h2:%d/%m/%Y} ({(h2 - d2).days} dias) sobre "
+            f"{c2:,.2f} EUR = {i2:,.2f} EUR."
+        )
+    else:
+        dd, hh, imp, reg = info["reg"]
+        st.info(
+            f"Disposicion de {disposicion[1]:,.2f} EUR el {disposicion[0]:%d/%m/%Y}, "
+            f"igual o posterior al bloqueo ({info['bloqueo']:%d/%m/%Y}): el recibo del "
+            f"{info['recibo']:%d/%m/%Y} ya esta emitido y sus intereses no cambian.  \n"
+            f"Intereses del importe dispuesto del {dd:%d/%m/%Y} al {hh:%d/%m/%Y} "
+            f"({(hh - dd).days} dias): {imp:,.2f} EUR = {reg:,.2f} EUR, que se suman "
+            f"a los intereses del recibo siguiente."
+        )
 
 if cambio_cuota is not None:
     if "cambio_cuota" in avisos:
