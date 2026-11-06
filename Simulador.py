@@ -182,7 +182,8 @@ def aplica_en_recibo(fecha_orden, fecha_recibo):
 
 def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
               seguro_tasa, fecha_joker=None, cambio_dia=None,
-              cambio_cuota=None, disposicion=None):
+              cambio_cuota=None, disposicion=None,
+              pct_inicial=None, base_cuota="inicial", capital_inicial=None):
     """
     fecha_joker: fecha de la orden del Joker o None.
       Recibo Joker: no se cobra nada al cliente (ni cuota ni seguro).
@@ -194,9 +195,19 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
       (un solo bloque, dias reales / 365 o 366). Los recibos siguientes
       pasan todos al nuevo dia.
 
-    cambio_cuota: (fecha_peticion, nueva_cuota) o None.
+    cambio_cuota: (fecha_peticion, tipo, valor) o None.
+      tipo = "pct"     -> valor es un porcentaje; la cuota se calcula sobre la base
+      tipo = "importe" -> valor es una mensualidad forzada en EUR
       Misma regla de bloqueo. Desde el recibo afectado se cobra la nueva
       cuota; los intereses no cambian, cambia el capital amortizado.
+
+    pct_inicial: porcentaje con el que se calcula la cuota actual, o None si
+      la cuota es manual (forzada).
+    base_cuota: "inicial"   -> cuota = capital inicial de apertura x porcentaje
+                "pendiente" -> cuota = capital pendiente (+ disposicion) x porcentaje
+      Con base "pendiente" y cuota por porcentaje, una disposicion recalcula la
+      cuota: antes del bloqueo, desde ese mismo recibo; igual o posterior al
+      bloqueo, desde el recibo siguiente. Una cuota forzada no se recalcula.
 
     disposicion: (fecha_disposicion, importe) o None.
       - Antes de la fecha de bloqueo del recibo: el periodo se divide en dos.
@@ -228,6 +239,10 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
     dispo_pendiente = disposicion is not None
     reg_intereses = Decimal("0")  # intereses de disposicion tras bloqueo, para el recibo siguiente
 
+    pct_actual = Decimal(str(pct_inicial)) if pct_inicial is not None else None
+    cap_inicial = Decimal(str(capital_inicial if capital_inicial is not None else capital))
+    cuota_diferida = None  # recalculo por disposicion tras bloqueo, para el recibo siguiente
+
     while saldo > 0:
 
         # -------- CAMBIO DE DIA DE PAGO --------
@@ -251,16 +266,31 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
 
         fb = fecha_bloqueo_para_mes(fecha_recibo)
 
+        # -------- RECALCULO DE CUOTA DIFERIDO (disposicion tras bloqueo) --------
+        marca_cuota = ""
+        if cuota_diferida is not None:
+            avisos["recalculo_cuota"]["recibo"] = fecha_recibo
+            avisos["recalculo_cuota"]["cuota_ant"] = cuota
+            cuota = cuota_diferida
+            cuota_diferida = None
+            marca_cuota = "Recalculo disposicion"
+
         # -------- CAMBIO DE MENSUALIDAD --------
-        hay_cambio_cuota = False
         if cuota_pendiente:
-            fecha_peticion_c, nueva_cuota = cambio_cuota
+            fecha_peticion_c, tipo_c, valor_c = cambio_cuota
             if aplica_en_recibo(fecha_peticion_c, fecha_recibo):
                 cuota_anterior = cuota
-                cuota = Decimal(str(nueva_cuota)).quantize(Decimal("0.01"), ROUND_HALF_UP)
-                hay_cambio_cuota = True
+                if tipo_c == "pct":
+                    pct_actual = Decimal(str(valor_c))
+                    base_c = cap_inicial if base_cuota == "inicial" else saldo
+                    cuota = cuota_desde_porcentaje(base_c, pct_actual)
+                else:
+                    pct_actual = None
+                    base_c = None
+                    cuota = Decimal(str(valor_c)).quantize(Decimal("0.01"), ROUND_HALF_UP)
+                marca_cuota = "Peticion"
                 cuota_pendiente = False
-                avisos["cambio_cuota"] = (fecha_recibo, cuota_anterior, cuota)
+                avisos["cambio_cuota"] = (fecha_recibo, cuota_anterior, cuota, base_c)
             elif fecha_peticion_c < fecha_recibo:
                 avisos["cambio_cuota_saltado"] = (fecha_recibo, fb)
 
@@ -314,6 +344,21 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
         interes = interes.quantize(Decimal("0.01"), ROUND_HALF_UP)
         saldo += importe_dispo
 
+        # -------- RECALCULO DE CUOTA POR DISPOSICION --------
+        # Base "capital pendiente": cuota = (capital pendiente + disposicion) x porcentaje
+        if importe_dispo > 0 and base_cuota == "pendiente" and pct_actual is not None:
+            nueva = cuota_desde_porcentaje(saldo, pct_actual)
+            avisos["recalculo_cuota"] = {
+                "base": saldo, "pct": pct_actual, "nueva": nueva,
+                "recibo": None, "cuota_ant": cuota,
+            }
+            if disposicion[0] < fb:
+                avisos["recalculo_cuota"]["recibo"] = fecha_recibo
+                cuota = nueva
+                marca_cuota = "Recalculo disposicion"
+            else:
+                cuota_diferida = nueva
+
         if es_joker:
             capitalizado = interes
             saldo = saldo + interes
@@ -342,7 +387,7 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
             "Fecha bloqueo": fb.strftime("%d/%m/%Y"),
             "Joker": "Si" if es_joker else "",
             "Cambio dia": "Si" if hay_cambio else "",
-            "Cambio cuota": "Si" if hay_cambio_cuota else "",
+            "Cambio cuota": marca_cuota,
             "Desde": fecha_anterior.strftime("%d/%m/%Y"),
             "Dias": dias,
             "Base interes": f"Real/{dias_ano_real(fecha_anterior)}",
@@ -370,8 +415,72 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
 
 
 # ---------------------------------------------------------
+# TAE (misma funcion que el simulador original)
+# ---------------------------------------------------------
+
+def calcular_tae(flujos, fechas):
+    tiempos = [0.0]
+    for i in range(1, len(fechas)):
+        f0 = fechas[i - 1]
+        f1 = fechas[i]
+        fraccion = (f1 - f0).days / dias_ano_real(f0)
+        tiempos.append(tiempos[-1] + fraccion)
+
+    def van(tasa):
+        return sum(c / ((1 + tasa) ** t) for c, t in zip(flujos, tiempos))
+
+    minimo, maximo = -0.9999, 10.0
+    for _ in range(1000):
+        medio = (minimo + maximo) / 2
+        v = van(medio)
+        if abs(v) < 1e-10:
+            return round(medio * 100, 2)
+        if v > 0:
+            minimo = medio
+        else:
+            maximo = medio
+    return round(medio * 100, 2)
+
+
+def tae_del_cuadro(df, capital, fecha_inicio, disposicion_aplicada=None):
+    """
+    Flujos: - capital pendiente en la fecha del recibo anterior,
+            - importe dispuesto en la fecha de la disposicion (si la hay),
+            + cuota cobrada en cada recibo (0 en el recibo Joker).
+    Devuelve None si el credito no llega a amortizarse.
+    """
+    if df.empty or df["Saldo (EUR)"].iloc[-1] > 0:
+        return None
+    movimientos = [(fecha_inicio, -float(capital))]
+    if disposicion_aplicada is not None:
+        movimientos.append((disposicion_aplicada[0], -float(disposicion_aplicada[1])))
+    for _, fila in df.iterrows():
+        fecha = datetime.strptime(fila["Fecha recibo"], "%d/%m/%Y").date()
+        movimientos.append((fecha, float(fila["Cuota (EUR)"])))
+    movimientos.sort(key=lambda m: m[0])
+    return calcular_tae([m[1] for m in movimientos], [m[0] for m in movimientos])
+
+
+# ---------------------------------------------------------
 # INPUTS
 # ---------------------------------------------------------
+
+if not porcentajes_cuota:
+    st.warning(f"No se encontro {FICHERO_PORCENTAJES}. Sube el fichero manualmente.")
+    fichero_pct = st.file_uploader(
+        f"Subir {FICHERO_PORCENTAJES}", type=["txt"], key="fichero_pct"
+    )
+    if fichero_pct:
+        porcentajes_cuota = _parsear_porcentajes(
+            fichero_pct.read().decode("utf-8").splitlines()
+        )
+        if porcentajes_cuota:
+            st.success(f"{len(porcentajes_cuota)} porcentajes cargados.")
+
+
+def etiqueta_pct(p):
+    return f"{str(p).replace('.', ',')} %"
+
 
 col1, col2 = st.columns(2)
 
@@ -398,11 +507,49 @@ with col2:
         step=0.01, format="%.2f",
         help="Base para calcular las cuotas: capital inicial x porcentaje del fichero."
     )
-    cuota_input = st.number_input(
-        "Cuota mensual (EUR)",
-        min_value=0.0, max_value=100_000.0, value=180.0,
-        step=0.01, format="%.2f"
+
+    base_str = st.radio(
+        "Base de calculo de la cuota",
+        ["Capital inicial de apertura", "Capital pendiente + disposicion"],
+        key="base_cuota",
+        help=(
+            "Capital inicial: cuota = capital inicial x porcentaje. "
+            "Capital pendiente + disposicion: cuota = capital pendiente x porcentaje, "
+            "y se recalcula al hacer una disposicion."
+        )
     )
+    base_cuota = "inicial" if base_str == "Capital inicial de apertura" else "pendiente"
+
+    modo_cuota = st.radio(
+        "Calculo de la cuota", ["Por porcentaje", "Manual (forzada)"],
+        horizontal=True, key="modo_cuota"
+    )
+    pct_inicial = None
+    if modo_cuota == "Por porcentaje" and porcentajes_cuota:
+        base_actual = capital_inicial if base_cuota == "inicial" else capital
+        opciones_pct = {
+            f"{etiqueta_pct(p)} -> {cuota_desde_porcentaje(base_actual, p):,.2f} EUR": p
+            for p in porcentajes_cuota
+        }
+        etiqueta_ini = st.selectbox(
+            "Porcentaje de la cuota", list(opciones_pct.keys()), key="pct_inicial"
+        )
+        pct_inicial = opciones_pct[etiqueta_ini]
+        cuota_input = float(cuota_desde_porcentaje(base_actual, pct_inicial))
+        st.caption(
+            f"Cuota: {cuota_input:,.2f} EUR = "
+            f"{'capital inicial' if base_cuota == 'inicial' else 'capital pendiente'} "
+            f"({base_actual:,.2f} EUR) x {etiqueta_pct(pct_inicial)}."
+        )
+    else:
+        if modo_cuota == "Por porcentaje":
+            st.caption("Sin fichero de porcentajes: introduce la cuota manualmente.")
+        cuota_input = st.number_input(
+            "Cuota mensual (EUR)",
+            min_value=0.0, max_value=100_000.0, value=180.0,
+            step=0.01, format="%.2f"
+        )
+
     opciones_seguro = {
         "No": 0,
         "Un titular Light": 0.0035,
@@ -493,31 +640,22 @@ with colm:
     )
     cambio_cuota = None
     if aplicar_cuota == "Si":
-        if not porcentajes_cuota:
-            st.warning(f"No se encontro {FICHERO_PORCENTAJES}. Sube el fichero manualmente.")
-            fichero_pct = st.file_uploader(
-                f"Subir {FICHERO_PORCENTAJES}", type=["txt"], key="fichero_pct"
-            )
-            if fichero_pct:
-                porcentajes_cuota = _parsear_porcentajes(
-                    fichero_pct.read().decode("utf-8").splitlines()
-                )
-                if porcentajes_cuota:
-                    st.success(f"{len(porcentajes_cuota)} porcentajes cargados.")
-
-        cuota_desplegable = None
+        pct_desplegable = None
         if porcentajes_cuota:
+            base_ref = capital_inicial if base_cuota == "inicial" else capital
             opciones_cuota = {
-                f"{cuota_desde_porcentaje(capital_inicial, p):,.2f} EUR "
-                f"({str(p).replace('.', ',')} %)": p
+                f"{cuota_desde_porcentaje(base_ref, p):,.2f} EUR ({etiqueta_pct(p)})": p
                 for p in porcentajes_cuota
             }
             etiqueta = st.selectbox(
                 "Nueva mensualidad", list(opciones_cuota.keys()), key="nueva_cuota"
             )
-            cuota_desplegable = cuota_desde_porcentaje(
-                capital_inicial, opciones_cuota[etiqueta]
-            )
+            pct_desplegable = opciones_cuota[etiqueta]
+            if base_cuota == "pendiente":
+                st.caption(
+                    "Importes calculados sobre el capital pendiente actual; el simulador "
+                    "usa el capital pendiente del recibo en que se aplique el cambio."
+                )
 
         # Mensualidad forzada: si se rellena, tiene prioridad sobre el desplegable
         texto_forzada = st.text_input(
@@ -538,22 +676,25 @@ with colm:
                 st.error("Mensualidad forzada no valida. Usa un importe como 175,50.")
 
         if cuota_forzada is not None:
-            nueva_cuota = cuota_forzada
-            origen = "mensualidad forzada"
-        elif cuota_desplegable is not None:
-            nueva_cuota = cuota_desplegable
-            origen = f"desplegable: capital inicial ({capital_inicial:,.2f} EUR) x porcentaje"
+            tipo_nueva, valor_nueva = "importe", cuota_forzada
+            origen = f"mensualidad forzada de {cuota_forzada:,.2f} EUR"
+        elif pct_desplegable is not None:
+            tipo_nueva, valor_nueva = "pct", pct_desplegable
+            origen = (
+                f"{etiqueta_pct(pct_desplegable)} del "
+                f"{'capital inicial' if base_cuota == 'inicial' else 'capital pendiente'}"
+            )
         else:
-            nueva_cuota = None
+            tipo_nueva = None
 
-        if nueva_cuota is not None:
+        if tipo_nueva is not None:
             fecha_cambio_cuota = st.date_input(
                 "Fecha de la peticion del cambio", fecha_simulacion,
                 key="fecha_cambio_cuota"
             )
-            cambio_cuota = (fecha_cambio_cuota, nueva_cuota)
+            cambio_cuota = (fecha_cambio_cuota, tipo_nueva, valor_nueva)
             st.caption(
-                f"Nueva mensualidad: {nueva_cuota:,.2f} EUR ({origen}). "
+                f"Nueva mensualidad: {origen}. "
                 "Los intereses no cambian; cambia el capital amortizado."
             )
         else:
@@ -566,8 +707,22 @@ with colm:
 
 df, avisos = simulador(
     capital, tin, cuota_input, fecha_inicio, dia_recibo,
-    seguro_tasa, fecha_joker, cambio_dia, cambio_cuota, disposicion
+    seguro_tasa, fecha_joker, cambio_dia, cambio_cuota, disposicion,
+    pct_inicial, base_cuota, capital_inicial
 )
+
+if "recalculo_cuota" in avisos:
+    rc = avisos["recalculo_cuota"]
+    if rc["recibo"] is not None:
+        st.info(
+            f"Recalculo de cuota por disposicion: (capital pendiente + disposicion) "
+            f"{rc['base']:,.2f} EUR x {etiqueta_pct(rc['pct'])} = {rc['nueva']:,.2f} EUR. "
+            f"Desde el recibo del {rc['recibo']:%d/%m/%Y} la cuota pasa de "
+            f"{rc['cuota_ant']:,.2f} EUR a {rc['nueva']:,.2f} EUR."
+        )
+elif disposicion is not None and base_cuota == "pendiente" and pct_inicial is None \
+        and not (cambio_cuota is not None and cambio_cuota[1] == "pct"):
+    st.caption("La cuota es manual (forzada): la disposicion no recalcula la cuota.")
 
 if disposicion is not None:
     info = avisos.get("disposicion")
@@ -601,11 +756,14 @@ if disposicion is not None:
 
 if cambio_cuota is not None:
     if "cambio_cuota" in avisos:
-        recibo_c, cuota_ant, cuota_nueva = avisos["cambio_cuota"]
+        recibo_c, cuota_ant, cuota_nueva, base_c = avisos["cambio_cuota"]
+        calculo = ""
+        if base_c is not None:
+            calculo = f" ({base_c:,.2f} EUR x {etiqueta_pct(cambio_cuota[2])})"
         texto = (
             f"Cambio de mensualidad pedido el {cambio_cuota[0]:%d/%m/%Y}: desde el recibo "
             f"del {recibo_c:%d/%m/%Y} la cuota pasa de {cuota_ant:,.2f} EUR "
-            f"a {cuota_nueva:,.2f} EUR."
+            f"a {cuota_nueva:,.2f} EUR{calculo}."
         )
         if "cambio_cuota_saltado" in avisos:
             saltado, fb_s = avisos["cambio_cuota_saltado"]
@@ -664,7 +822,36 @@ else:
     st.subheader("Cuadro de amortizacion")
     st.dataframe(df.round(2))
 
-    t1, t2, t3 = st.columns(3)
+    # -------- TAE original (sin operaciones) y CER (con las operaciones) --------
+    df_original, _ = simulador(
+        capital, tin, cuota_input, fecha_inicio, dia_recibo, seguro_tasa,
+        pct_inicial=pct_inicial, base_cuota=base_cuota, capital_inicial=capital_inicial
+    )
+    tae_original = tae_del_cuadro(df_original, capital, fecha_inicio)
+
+    hay_operaciones = any(
+        x is not None for x in (fecha_joker, cambio_dia, cambio_cuota, disposicion)
+    )
+    dispo_aplicada = disposicion if "disposicion" in avisos else None
+    cer = tae_del_cuadro(df, capital, fecha_inicio, dispo_aplicada) if hay_operaciones else None
+
+    t1, t2, t3, t4, t5 = st.columns(5)
     t1.metric("Numero de recibos", len(df))
     t2.metric("Total intereses", f"{df['Intereses (EUR)'].sum():,.2f} EUR")
     t3.metric("Total pagado", f"{df['Recibo total (EUR)'].sum():,.2f} EUR")
+    t4.metric("TAE original", f"{tae_original:.2f} %" if tae_original is not None else "n/d")
+    if not hay_operaciones:
+        t5.metric("CER", "Sin cambios")
+    else:
+        t5.metric(
+            "CER", f"{cer:.2f} %" if cer is not None else "n/d",
+            delta=(f"{cer - tae_original:+.2f} pp"
+                   if cer is not None and tae_original is not None else None),
+            delta_color="off"
+        )
+    st.caption(
+        "TAE original: cuadro sin operaciones. CER: recalculada con las operaciones "
+        "simuladas (Joker, cambio de dia, cambio de mensualidad, disposicion). "
+        "Flujos: capital pendiente y disposicion entregados; cuotas cobradas (sin seguro). "
+        "n/d: el credito no se amortiza en 600 recibos."
+    )
