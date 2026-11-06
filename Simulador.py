@@ -7,8 +7,8 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 
 getcontext().prec = 10
 
-st.set_page_config(page_title="Simulador Joker y cambio de dia", layout="wide")
-st.title("Simulador Joker y cambio de dia — Revolving")
+st.set_page_config(page_title="Simulador Revolving", layout="wide")
+st.title("Simulador Revolving")
 
 # ---------------------------------------------------------
 # CARGA FECHAS DE BLOQUEO
@@ -517,7 +517,7 @@ with col1:
 
 with col2:
     capital_inicial = st.number_input(
-        "Capital inicial de apertura (EUR)",
+        "Importe de la base de calculo de la cuota (EUR)",
         min_value=0.0, max_value=1_000_000.0, value=6000.0,
         step=0.01, format="%.2f",
         help="Base para calcular las cuotas: capital inicial x porcentaje del fichero."
@@ -846,7 +846,11 @@ else:
         if cuota_forzada is not None:
             escenarios.append(("Mensualidad forzada", ("importe", cuota_forzada)))
 
-        filas = []
+        def eur(v):
+            return f"{float(v):,.2f}"
+
+        seguro_activo = seguro_tasa > 0
+        columnas = {}
         for nombre, cambio in escenarios:
             cc = (cambio_cuota[0],) + cambio if cambio is not None else None
             df_e, av_e = simulador(
@@ -856,44 +860,61 @@ else:
             )
             if df_e.empty:
                 continue
-            if "cambio_cuota" in av_e:
-                recibo_e, _, cuota_e, _ = av_e["cambio_cuota"]
-            else:
+
+            # Base de calculo y porcentaje de la cuota
+            if cambio is None:
                 recibo_e = datetime.strptime(df_e["Fecha recibo"].iloc[0], "%d/%m/%Y").date()
-                cuota_e = Decimal(str(df_e["Cuota contrato (EUR)"].iloc[0]))
+                if pct_inicial is not None:
+                    base_e = capital_inicial if base_cuota == "inicial" else capital
+                    pct_txt = etiqueta_pct(pct_inicial)
+                else:
+                    base_e, pct_txt = None, "Manual (forzada)"
+            else:
+                recibo_e, _, _, base_e = av_e["cambio_cuota"] if "cambio_cuota" in av_e \
+                    else (None, None, None, None)
+                pct_txt = etiqueta_pct(cambio[1]) if cambio[0] == "pct" else "Forzada"
+            if recibo_e is None:
+                continue
+
+            # Datos del proximo recibo (el primero con la cuota de esta opcion)
+            fila_r = df_e[df_e["Fecha recibo"] == recibo_e.strftime("%d/%m/%Y")].iloc[0]
+
             amortizado = df_e["Saldo (EUR)"].iloc[-1] <= 0
             dispo_e = disposicion if "disposicion" in av_e else None
-            cer_e = tae_del_cuadro(df_e, capital, fecha_inicio, dispo_e)
-            filas.append({
-                "Seleccionada": "<<" if cc == cambio_cuota else "",
-                "Opcion": nombre,
-                "Proximo recibo (nueva cuota)": recibo_e.strftime("%d/%m/%Y"),
-                "Cuota (EUR)": float(cuota_e),
-                "Duracion (meses)": str(len(df_e)) if amortizado else "No se amortiza",
-                "Ultimo recibo": df_e["Fecha recibo"].iloc[-1] if amortizado else "",
-                "Total intereses (EUR)": round(float(df_e["Intereses (EUR)"].sum()), 2),
-                "Total a pagar capital + intereses (EUR)": round(float(df_e["Cuota (EUR)"].sum()), 2),
-                "CER (%)": f"{cer_e:.2f}" if cer_e is not None else "n/d",
-            })
+            tae_e = tae_del_cuadro(df_e, capital, fecha_inicio, dispo_e)
+
+            total_intereses = df_e["Intereses (EUR)"].sum()
+            total_seguros = df_e["Seguro (EUR)"].sum() if seguro_activo else 0.0
+            total_sin_seguro = df_e["Cuota (EUR)"].sum()
+            total_con_seguro = total_sin_seguro + total_seguros
+
+            seguro_prox = fila_r["Seguro (EUR)"] if seguro_activo else 0.0
+            cuota_prox = fila_r["Cuota (EUR)"]
+
+            cabecera = f"{nombre} <<" if cc == cambio_cuota else nombre
+            columnas[cabecera] = {
+                "Base de calculo (EUR)": eur(base_e) if base_e is not None else "-",
+                "Porcentaje cuota": pct_txt,
+                "Fecha proximo recibo": recibo_e.strftime("%d/%m/%Y"),
+                "Importe proximo recibo (EUR)": eur(cuota_prox),
+                "Seguro proximo recibo (EUR)": eur(seguro_prox),
+                "Mensualidad con seguro (EUR)": eur(cuota_prox + seguro_prox),
+                "Duracion total (meses)": str(len(df_e)) if amortizado else "No se amortiza",
+                "TIN (%)": f"{tin:.2f}",
+                "TAE (%)": f"{tae_e:.2f}" if tae_e is not None else "n/d",
+                "Total intereses (EUR)": eur(total_intereses),
+                "Total seguros (EUR)": eur(total_seguros),
+                "Total a pagar con seguro (EUR)": eur(total_con_seguro),
+                "Total a pagar sin seguro (EUR)": eur(total_sin_seguro),
+            }
 
         st.subheader("Comparativa de mensualidades")
         st.caption(
-            "Cada fila simula el credito con esa mensualidad desde el recibo en que se "
+            "Cada columna simula el credito con esa mensualidad desde el recibo en que se "
             "aplica el cambio, manteniendo el resto de operaciones marcadas. "
-            "<< = opcion seleccionada."
+            "<< = opcion seleccionada. Sin seguro, el total con seguro es igual al total sin seguro."
         )
-        # Traspuesta: columnas = opciones (porcentajes), filas = datos
-        df_comp = pd.DataFrame(filas)
-        df_comp["Opcion"] = [
-            f"{o} <<" if s else o for o, s in zip(df_comp["Opcion"], df_comp["Seleccionada"])
-        ]
-        df_comp = df_comp.drop(columns=["Seleccionada"]).set_index("Opcion")
-        for col in ["Cuota (EUR)", "Total intereses (EUR)",
-                    "Total a pagar capital + intereses (EUR)"]:
-            df_comp[col] = df_comp[col].map(lambda v: f"{v:,.2f}")
-        df_comp = df_comp.astype(str).T
-        df_comp.columns.name = None
-        st.dataframe(df_comp)
+        st.dataframe(pd.DataFrame(columnas))
 
     st.subheader("Cuadro de amortizacion")
     st.dataframe(df.round(2))
