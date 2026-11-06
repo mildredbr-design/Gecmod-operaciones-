@@ -505,6 +505,7 @@ with col1:
         min_value=0.0, max_value=1_000_000.0, value=6000.0,
         step=0.01, format="%.2f"
     )
+    st.caption("Importe del capital pendiente que aparece en GEC.")
     tin = st.number_input("TIN anual (%)", 0.0, 100.0, 21.79)
     fecha_simulacion = st.date_input("Fecha de simulacion", datetime.today())
     dia_recibo = st.selectbox("Dia del recibo", list(range(1, 29)))
@@ -522,6 +523,7 @@ with col2:
         step=0.01, format="%.2f",
         help="Base para calcular las cuotas: capital inicial x porcentaje del fichero."
     )
+    st.caption("Utilizar el dato que aparece en GECMOD como base de calculo de la cuota.")
 
     base_str = st.radio(
         "Base de calculo de la cuota",
@@ -534,10 +536,19 @@ with col2:
         )
     )
     base_cuota = "inicial" if base_str == "Capital inicial de apertura" else "pendiente"
+    st.caption(
+        "El sistema tiene dos formas de calcular la cuota: sobre el capital inicial de "
+        "apertura, o sobre el capital pendiente mas la disposicion (la cuota se "
+        "recalcula con cada disposicion). Selecciona la que corresponda al contrato."
+    )
 
     modo_cuota = st.radio(
         "Calculo de la cuota", ["Por porcentaje", "Manual (forzada)"],
         horizontal=True, key="modo_cuota"
+    )
+    st.caption(
+        "Por porcentaje: base de calculo x porcentaje (minimo 15 EUR). "
+        "Manual (forzada): casos especiales ya conocidos en la base."
     )
     pct_inicial = None
     if modo_cuota == "Por porcentaje" and porcentajes_cuota:
