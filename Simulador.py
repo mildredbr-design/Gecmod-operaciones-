@@ -882,7 +882,18 @@ else:
             "aplica el cambio, manteniendo el resto de operaciones marcadas. "
             "<< = opcion seleccionada."
         )
-        st.dataframe(pd.DataFrame(filas))
+        # Traspuesta: columnas = opciones (porcentajes), filas = datos
+        df_comp = pd.DataFrame(filas)
+        df_comp["Opcion"] = [
+            f"{o} <<" if s else o for o, s in zip(df_comp["Opcion"], df_comp["Seleccionada"])
+        ]
+        df_comp = df_comp.drop(columns=["Seleccionada"]).set_index("Opcion")
+        for col in ["Cuota (EUR)", "Total intereses (EUR)",
+                    "Total a pagar capital + intereses (EUR)"]:
+            df_comp[col] = df_comp[col].map(lambda v: f"{v:,.2f}")
+        df_comp = df_comp.astype(str).T
+        df_comp.columns.name = None
+        st.dataframe(df_comp)
 
     st.subheader("Cuadro de amortizacion")
     st.dataframe(df.round(2))
