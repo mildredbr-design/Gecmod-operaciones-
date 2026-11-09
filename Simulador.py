@@ -710,7 +710,7 @@ with colj:
         )
         st.caption(
             "En el recibo Joker el cliente no paga cuota revolving , solo paga cuota del seguro, y los intereses "
-            "del periodo se suman al capital pendiente.
+            "del periodo se suman al capital pendiente."
         )
 
 with colc:
