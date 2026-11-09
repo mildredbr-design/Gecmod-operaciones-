@@ -417,11 +417,14 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
                 cuota_diferida = nueva
 
         if es_joker:
+            # Recibo Joker: no se cobra cuota, pero el seguro si se pasa al banco
+            seguro = ((saldo + interes) * seguro_tasa).quantize(
+                Decimal("0.01"), ROUND_HALF_UP
+            )
             capitalizado = interes
             saldo = saldo + interes
             amort = Decimal("0")
             cuota_final = Decimal("0")
-            seguro = Decimal("0")
         else:
             capitalizado = Decimal("0")
             seguro = ((saldo + interes) * seguro_tasa).quantize(
