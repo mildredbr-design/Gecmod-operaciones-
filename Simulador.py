@@ -243,7 +243,7 @@ def simulador(capital, tin, cuota_mensual, fecha_inicio, dia_recibo,
               pct_inicial=None, base_cuota="inicial", capital_inicial=None):
     """
     fecha_joker: fecha de la orden del Joker o None.
-      Recibo Joker: no se cobra nada al cliente (ni cuota ni seguro).
+      Recibo Joker: no se cobra cuota revolving. El recibo del seguro si se pasa al banco.
       Los intereses del periodo se suman al capital pendiente.
 
     cambio_dia: (fecha_peticion, nuevo_dia) o None.
@@ -709,8 +709,8 @@ with colj:
             "Fecha de la orden del Joker", fecha_simulacion, key="fecha_joker"
         )
         st.caption(
-            "En el recibo Joker el cliente no paga nada y los intereses "
-            "del periodo se suman al capital pendiente."
+            "En el recibo Joker el cliente no paga cuota revolving , solo paga cuota del seguro, y los intereses "
+            "del periodo se suman al capital pendiente.
         )
 
 with colc:
